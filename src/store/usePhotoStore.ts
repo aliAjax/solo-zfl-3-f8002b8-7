@@ -1,12 +1,12 @@
 import { create } from 'zustand';
 import {
-  loadManifest,
-  saveManifest,
-  hashBlob,
-  putPhotoBlobs,
-  deletePhotoBlobs,
-  listAllBlobKeys,
+  initPhotoDb,
+  readManifest,
+  commitManifest,
+  subscribePhotoChanges,
+  reconcileBlobs,
   estimateAvailableBytes,
+  hashBlob,
   QuotaError,
 } from '@/utils/photoStorage';
 import type { PhotoManifest, BenchPhotoLink } from '@/utils/photoStorage';
@@ -18,328 +18,315 @@ export interface AddPhotosResult {
   reusedCount: number;
 }
 
+interface HashedFile {
+  file: File;
+  hash: string;
+}
+
 interface PhotoState {
   manifest: PhotoManifest;
   initialized: boolean;
-  /** 清单损坏时为 true：可读、可上传，但不再自动写回以免覆盖残留数据 */
+  /** 数据库/清单不可用时为 true：可浏览（占位），禁止写入 */
   manifestCorrupt: boolean;
   initialize: () => void;
-  /** 删除 IDB 中清单已无引用的孤儿 blob */
-  reconcileBlobs: () => Promise<void>;
   /**
    * 为一张长椅批量添加照片。
-   * 先完成校验 / 哈希去重 / 配额预检，再在一个事务里写 blob，最后更新清单；
-   * 任一步失败全部回滚，不留下断链。
+   * 哈希与预检在事务外完成；最终去重、引用计数、blob 写入与清单更新
+   * 在一个跨标签页串行的 IDB 事务内原子提交。
+   * 任一步失败整体回滚，不留下断链；两个标签页同时上传不会互相覆盖。
    */
   addPhotos: (benchId: string, files: File[]) => Promise<AddPhotosResult>;
-  /** 从长椅移除一张照片；该照片引用归零时连 blob 一起清走 */
+  /** 从长椅移除一张照片；该照片引用归零时同一事务内清走 blob */
   removePhoto: (benchId: string, hash: string) => Promise<void>;
   /** 调整某张长椅内照片顺序 */
-  reorderPhotos: (benchId: string, orderedHashes: string[]) => void;
+  reorderPhotos: (benchId: string, orderedHashes: string[]) => Promise<void>;
   /** 把某张照片设为封面（移到第一位） */
-  setCover: (benchId: string, hash: string) => void;
+  setCover: (benchId: string, hash: string) => Promise<void>;
   /** 删除长椅时调用：释放其全部照片引用并 GC */
   releaseBenchPhotos: (benchId: string) => Promise<void>;
   getBenchPhotos: (benchId: string) => BenchPhotoLink[];
   getCoverHash: (benchId: string) => string | undefined;
 }
 
-export const usePhotoStore = create<PhotoState>((set, get) => ({
-  manifest: { photos: {}, links: {}, version: 1 },
-  initialized: false,
-  manifestCorrupt: false,
+const EMPTY_MANIFEST: PhotoManifest = { photos: {}, links: {}, revision: 0 };
 
-  initialize: () => {
-    if (get().initialized) return;
+export const usePhotoStore = create<PhotoState>((set, get) => {
+  /** 把数据库的最新清单同步进内存（跨标签页改动后调用） */
+  const refresh = async () => {
     try {
-      const manifest = loadManifest();
-      set({ manifest, initialized: true, manifestCorrupt: false });
-      // 后台对账：清掉清单中已不存在引用的孤儿 blob（上次 GC 事务失败的残留）
-      void get().reconcileBlobs();
+      const manifest = await readManifest();
+      set({ manifest, manifestCorrupt: false });
     } catch (error) {
-      // 清单损坏：用空清单继续提供只读浏览，绝不写回，避免覆盖残留数据
-      console.error('照片清单损坏，照片暂不可用：', error);
-      set({
-        manifest: { photos: {}, links: {}, version: 1 },
-        initialized: true,
-        manifestCorrupt: true,
-      });
+      console.error('照片清单刷新失败：', error);
     }
-  },
+  };
 
-  reconcileBlobs: async () => {
+  /** 跨标签页的并发安全：仅当新清单修订号更新时才覆盖内存 */
+  const refreshIfNewer = async () => {
     try {
-      const keys = await listAllBlobKeys();
-      const referenced = new Set(Object.keys(get().manifest.photos));
-      const orphans = keys.filter((key) => !referenced.has(key));
-      if (orphans.length > 0) {
-        await deletePhotoBlobs(orphans);
+      const latest = await readManifest();
+      if (latest.revision > get().manifest.revision) {
+        set({ manifest: latest, manifestCorrupt: false });
       }
     } catch (error) {
-      // 对账失败不影响使用，下次启动再试
-      console.warn('照片存储对账失败，已跳过：', error);
+      console.error('照片清单跨标签页同步失败：', error);
     }
-  },
+  };
 
-  addPhotos: async (benchId, files) => {
-    if (files.length === 0) {
-      return { ok: false, error: '没有选择照片', addedCount: 0, reusedCount: 0 };
-    }
-    if (get().manifestCorrupt) {
-      return {
-        ok: false,
-        error: '照片清单已损坏，为避免覆盖数据已禁止写入。请刷新页面；若仍失败，需清空照片存储后重试。',
-        addedCount: 0,
-        reusedCount: 0,
-      };
-    }
+  return {
+    manifest: EMPTY_MANIFEST,
+    initialized: false,
+    manifestCorrupt: false,
 
-    // 1. 类型校验：任何一个不是图片，整批拒绝（互不影响已有内容）
-    const invalid = files.find((f) => !f.type.startsWith('image/'));
-    if (invalid) {
-      return {
-        ok: false,
-        error: `“${invalid.name}”不是图片文件，已取消整批上传`,
-        addedCount: 0,
-        reusedCount: 0,
-      };
-    }
+    initialize: () => {
+      if (get().initialized) return;
+      // 先标记，避免 StrictMode / 多入口重复初始化
+      set({ initialized: true });
 
-    // 2. 哈希（计算本身不改任何数据）
-    const hashed: { file: File; hash: string }[] = [];
-    for (const file of files) {
-      try {
-        hashed.push({ file, hash: await hashBlob(file) });
-      } catch (error) {
-        console.error('照片读取失败：', error);
+      initPhotoDb()
+        .then(async () => {
+          // 后台对账：清掉无引用孤儿 blob（与清单同库串行，不会误删在途上传）
+          reconcileBlobs().catch((e) => console.warn('照片对账跳过：', e));
+          await refresh();
+          // 订阅其它标签页的提交
+          subscribePhotoChanges(() => {
+            void refreshIfNewer();
+          });
+        })
+        .catch((error) => {
+          console.error('照片库初始化失败，照片以占位显示：', error);
+          set({ manifestCorrupt: true });
+        });
+    },
+
+    addPhotos: async (benchId, files) => {
+      if (files.length === 0) {
+        return { ok: false, error: '没有选择照片', addedCount: 0, reusedCount: 0 };
+      }
+      if (get().manifestCorrupt) {
         return {
           ok: false,
-          error: `“${file.name}”读取失败，已取消整批上传`,
+          error: '照片库当前不可用，已禁止写入，已有内容不受影响',
           addedCount: 0,
           reusedCount: 0,
         };
       }
-    }
 
-    const manifest = get().manifest;
-    const existingLinks = manifest.links[benchId] ?? [];
-    const existingHashes = new Set(existingLinks.map((l) => l.hash));
-
-    // 3. 批内去重 + 与该长椅已有引用去重
-    const seen = new Set<string>();
-    const uniqueNew: { file: File; hash: string }[] = [];
-    let duplicatePicks = 0;
-    let reusedStorage = 0;
-    for (const item of hashed) {
-      if (existingHashes.has(item.hash)) {
-        // 该长椅已经挂着同样内容
-        duplicatePicks += 1;
-        continue;
-      }
-      if (seen.has(item.hash)) {
-        // 本批次里重复选择
-        duplicatePicks += 1;
-        continue;
-      }
-      seen.add(item.hash);
-      if (manifest.photos[item.hash]) {
-        // 其它长椅已存有同样内容：共用这份存储，不再写 blob
-        reusedStorage += 1;
-      } else {
-        uniqueNew.push(item);
-      }
-    }
-    const addedLinks = seen.size;
-
-    // 4. 配额预检：只统计真正需要新写入的字节
-    const requiredBytes = uniqueNew.reduce((sum, item) => sum + item.file.size, 0);
-    if (requiredBytes > 0) {
-      const available = await estimateAvailableBytes();
-      if (available !== null && requiredBytes > available) {
-        throw new QuotaError(requiredBytes, available);
-      }
-    }
-
-    // 5. 一个 IndexedDB 事务写全部新 blob；失败则整体中止，清单不动
-    try {
-      await putPhotoBlobs(uniqueNew.map(({ file, hash }) => ({ hash, blob: file })));
-    } catch (error) {
-      console.error('照片写入失败，整批回滚：', error);
-      const available = await estimateAvailableBytes();
-      if (available !== null && requiredBytes > available) {
-        throw new QuotaError(requiredBytes, available);
-      }
-      return {
-        ok: false,
-        error: '照片写入失败，已取消整批上传，已有照片不受影响',
-        addedCount: 0,
-        reusedCount: 0,
-      };
-    }
-
-    // 全部是该长椅已挂过的照片：没有任何新引用，无需改动清单
-    if (addedLinks === 0) {
-      return {
-        ok: true,
-        addedCount: 0,
-        reusedCount: duplicatePicks,
-      };
-    }
-
-    // 6. blob 落盘成功后才更新清单（引用）；manifest 极小，localStorage 失败视为整体失败
-    const nextManifest: PhotoManifest = {
-      version: 1,
-      photos: { ...manifest.photos },
-      links: {
-        ...manifest.links,
-        [benchId]: [...existingLinks],
-      },
-    };
-
-    for (const { file, hash } of uniqueNew) {
-      nextManifest.photos[hash] = { hash, type: file.type, size: file.size, refs: [benchId] };
-    }
-    for (const hash of seen) {
-      if (nextManifest.photos[hash] && !nextManifest.photos[hash].refs.includes(benchId)) {
-        nextManifest.photos[hash] = {
-          ...nextManifest.photos[hash],
-          refs: [...nextManifest.photos[hash].refs, benchId],
+      // 1. 类型校验：任一非图片，整批拒绝
+      const invalid = files.find((f) => !f.type.startsWith('image/'));
+      if (invalid) {
+        return {
+          ok: false,
+          error: `“${invalid.name}”不是图片文件，已取消整批上传`,
+          addedCount: 0,
+          reusedCount: 0,
         };
       }
-    }
-    for (const { file, hash } of hashed) {
-      if (!existingHashes.has(hash) && !nextManifest.links[benchId].some((l) => l.hash === hash)) {
-        nextManifest.links[benchId].push({ hash, name: file.name });
+
+      // 2. 哈希（只读，不改数据）
+      const hashed: HashedFile[] = [];
+      for (const file of files) {
+        try {
+          hashed.push({ file, hash: await hashBlob(file) });
+        } catch (error) {
+          console.error('照片读取失败：', error);
+          return {
+            ok: false,
+            error: `“${file.name}”读取失败，已取消整批上传`,
+            addedCount: 0,
+            reusedCount: 0,
+          };
+        }
       }
-    }
 
-    try {
-      saveManifest(nextManifest);
-    } catch (error) {
-      console.error('照片清单写入失败，回滚新写入的 blob：', error);
-      await deletePhotoBlobs(uniqueNew.map(({ hash }) => hash)).catch(() => undefined);
-      const available = await estimateAvailableBytes();
-      if (available !== null) {
-        throw new QuotaError(requiredBytes, available);
+      // 3. 建议性配额预检（以已知清单估算真正要新写的字节；
+      //    权威判定在事务内；预检仅用于尽早、明确地拒绝）
+      const snapshot = get().manifest;
+      const knownHashes = new Set([
+        ...Object.keys(snapshot.photos),
+        ...(snapshot.links[benchId] ?? []).map((l) => l.hash),
+      ]);
+      const requiredBytes = hashed
+        .filter((h) => !knownHashes.has(h.hash))
+        .reduce((sum, h) => sum + h.file.size, 0);
+      if (requiredBytes > 0) {
+        const available = await estimateAvailableBytes();
+        if (available !== null && requiredBytes > available) {
+          throw new QuotaError(requiredBytes, available);
+        }
       }
-      throw error;
-    }
 
-    set({ manifest: nextManifest });
-    return { ok: true, addedCount: addedLinks, reusedCount: reusedStorage + duplicatePicks };
-  },
+      // 4. 事务内权威提交。闭包回传统计结果。
+      const stats = { addedLinks: 0, reusedStorage: 0, duplicatePicks: 0, requiredInTx: 0 };
+      let next: PhotoManifest;
+      try {
+        next = await commitManifest((base) => {
+          const existingLinks = base.links[benchId] ?? [];
+          const existingHashes = new Set(existingLinks.map((l) => l.hash));
 
-  removePhoto: async (benchId, hash) => {
-    if (get().manifestCorrupt) throw new Error('照片清单已损坏，已禁止改动');
-    const manifest = get().manifest;
-    const links = manifest.links[benchId];
-    if (!links?.some((l) => l.hash === hash)) return;
+          const photos = { ...base.photos };
+          const appended: BenchPhotoLink[] = [];
+          const putBlobs: { hash: string; blob: Blob }[] = [];
+          const seen = new Set<string>();
+          let txRequired = 0;
 
-    const nextLinks = links.filter((l) => l.hash !== hash);
-    const nextManifest: PhotoManifest = {
-      version: 1,
-      photos: { ...manifest.photos },
-      links: { ...manifest.links },
-    };
-    if (nextLinks.length === 0) {
-      delete nextManifest.links[benchId];
-    } else {
-      nextManifest.links[benchId] = nextLinks;
-    }
+          for (const { file, hash } of hashed) {
+            if (existingHashes.has(hash) || seen.has(hash)) {
+              stats.duplicatePicks += 1;
+              continue;
+            }
+            seen.add(hash);
+            appended.push({ hash, name: file.name });
 
-    // 引用计数减一
-    const meta = nextManifest.photos[hash];
-    let gcHash: string | null = null;
-    if (meta) {
-      const refs = meta.refs.filter((r) => r !== benchId);
-      if (refs.length === 0) {
-        delete nextManifest.photos[hash];
-        gcHash = hash;
-      } else {
-        nextManifest.photos[hash] = { ...meta, refs };
+            if (photos[hash]) {
+              // 内容已存在（可能正是另一个标签页刚提交的）：共用这份存储
+              stats.reusedStorage += 1;
+              if (!photos[hash].refs.includes(benchId)) {
+                photos[hash] = { ...photos[hash], refs: [...photos[hash].refs, benchId] };
+              }
+            } else {
+              photos[hash] = { hash, type: file.type, size: file.size, refs: [benchId] };
+              putBlobs.push({ hash, blob: file });
+              txRequired += file.size;
+            }
+          }
+          stats.addedLinks = appended.length;
+          stats.requiredInTx = txRequired;
+
+          return {
+            manifest: {
+              photos,
+              links: { ...base.links, [benchId]: [...existingLinks, ...appended] },
+            },
+            putBlobs,
+          };
+        });
+      } catch (error) {
+        if (error instanceof QuotaError) throw error;
+        console.error('照片事务提交失败，已回滚：', error);
+        // 可能是预检后空间被占用：给出明确的空间类提示
+        const available = await estimateAvailableBytes();
+        if (available !== null && stats.requiredInTx > available) {
+          throw new QuotaError(stats.requiredInTx, available);
+        }
+        return {
+          ok: false,
+          error: '照片保存失败，整批上传已取消，已有照片不受影响',
+          addedCount: 0,
+          reusedCount: 0,
+        };
       }
-    }
 
-    // 先持久化清单再 GC blob；即使 blob 删除失败也不会产生断链
-    saveManifest(nextManifest);
-    set({ manifest: nextManifest });
-    if (gcHash) {
-      await deletePhotoBlobs([gcHash]).catch((error) =>
-        console.error('无引用照片清理失败（将在下次清理时重试）：', error),
-      );
-    }
-  },
+      set({ manifest: next, manifestCorrupt: false });
+      return {
+        ok: true,
+        addedCount: stats.addedLinks,
+        reusedCount: stats.reusedStorage + stats.duplicatePicks,
+      };
+    },
 
-  reorderPhotos: (benchId, orderedHashes) => {
-    if (get().manifestCorrupt) throw new Error('照片清单已损坏，已禁止改动');
-    const manifest = get().manifest;
-    const links = manifest.links[benchId];
-    if (!links) return;
-    const byHash = new Map(links.map((l) => [l.hash, l]));
-    const reordered = orderedHashes
-      .map((hash) => byHash.get(hash))
-      .filter((l): l is BenchPhotoLink => Boolean(l));
-    // 保持集合一致，仅改顺序
-    if (reordered.length !== links.length) return;
+    removePhoto: async (benchId, hash) => {
+      if (get().manifestCorrupt) throw new Error('照片库当前不可用，已禁止改动');
+      const next = await commitManifest((base) => {
+        const links = base.links[benchId];
+        if (!links?.some((l) => l.hash === hash)) {
+          return { manifest: { photos: base.photos, links: base.links } };
+        }
 
-    const nextManifest: PhotoManifest = {
-      ...manifest,
-      links: { ...manifest.links, [benchId]: reordered },
-    };
-    saveManifest(nextManifest);
-    set({ manifest: nextManifest });
-  },
+        const nextLinks = links.filter((l) => l.hash !== hash);
+        const linksMap = { ...base.links };
+        if (nextLinks.length === 0) delete linksMap[benchId];
+        else linksMap[benchId] = nextLinks;
 
-  setCover: (benchId, hash) => {
-    if (get().manifestCorrupt) throw new Error('照片清单已损坏，已禁止改动');
-    const manifest = get().manifest;
-    const links = manifest.links[benchId];
-    if (!links?.some((l) => l.hash === hash)) return;
-    const target = links.find((l) => l.hash === hash)!;
-    const reordered = [target, ...links.filter((l) => l.hash !== hash)];
-    const nextManifest: PhotoManifest = {
-      ...manifest,
-      links: { ...manifest.links, [benchId]: reordered },
-    };
-    saveManifest(nextManifest);
-    set({ manifest: nextManifest });
-  },
+        const photos = { ...base.photos };
+        let gcHash: string | null = null;
+        const meta = photos[hash];
+        if (meta) {
+          const refs = meta.refs.filter((r) => r !== benchId);
+          if (refs.length === 0) {
+            delete photos[hash];
+            gcHash = hash;
+          } else {
+            photos[hash] = { ...meta, refs };
+          }
+        }
 
-  releaseBenchPhotos: async (benchId) => {
-    if (get().manifestCorrupt) return;
-    const manifest = get().manifest;
-    const links = manifest.links[benchId];
-    if (!links) return;
+        return {
+          manifest: { photos, links: linksMap },
+          deleteBlobs: gcHash ? [gcHash] : undefined,
+        };
+      });
+      set({ manifest: next });
+    },
 
-    const nextManifest: PhotoManifest = {
-      version: 1,
-      photos: { ...manifest.photos },
-      links: { ...manifest.links },
-    };
-    delete nextManifest.links[benchId];
+    reorderPhotos: async (benchId, orderedHashes) => {
+      if (get().manifestCorrupt) throw new Error('照片库当前不可用，已禁止改动');
+      const next = await commitManifest((base) => {
+        const links = base.links[benchId];
+        if (!links) return { manifest: { photos: base.photos, links: base.links } };
+        const byHash = new Map(links.map((l) => [l.hash, l]));
+        const reordered = orderedHashes
+          .map((h) => byHash.get(h))
+          .filter((l): l is BenchPhotoLink => Boolean(l));
+        // 只允许重排、不允许增删；集合不一致则放弃本次改动
+        if (reordered.length !== links.length) {
+          return { manifest: { photos: base.photos, links: base.links } };
+        }
+        return {
+          manifest: { photos: base.photos, links: { ...base.links, [benchId]: reordered } },
+        };
+      });
+      set({ manifest: next });
+    },
 
-    const gcHashes: string[] = [];
-    for (const link of links) {
-      const meta = nextManifest.photos[link.hash];
-      if (!meta) continue;
-      const refs = meta.refs.filter((r) => r !== benchId);
-      if (refs.length === 0) {
-        delete nextManifest.photos[link.hash];
-        gcHashes.push(link.hash);
-      } else {
-        nextManifest.photos[link.hash] = { ...meta, refs };
-      }
-    }
+    setCover: async (benchId, hash) => {
+      if (get().manifestCorrupt) throw new Error('照片库当前不可用，已禁止改动');
+      const next = await commitManifest((base) => {
+        const links = base.links[benchId];
+        if (!links?.some((l) => l.hash === hash)) {
+          return { manifest: { photos: base.photos, links: base.links } };
+        }
+        const target = links.find((l) => l.hash === hash)!;
+        const reordered = [target, ...links.filter((l) => l.hash !== hash)];
+        return {
+          manifest: { photos: base.photos, links: { ...base.links, [benchId]: reordered } },
+        };
+      });
+      set({ manifest: next });
+    },
 
-    saveManifest(nextManifest);
-    set({ manifest: nextManifest });
-    if (gcHashes.length > 0) {
-      await deletePhotoBlobs(gcHashes).catch((error) =>
-        console.error('删除长椅后照片清理失败：', error),
-      );
-    }
-  },
+    releaseBenchPhotos: async (benchId) => {
+      if (get().manifestCorrupt) return;
+      const next = await commitManifest((base) => {
+        const links = base.links[benchId];
+        if (!links) return { manifest: { photos: base.photos, links: base.links } };
 
-  getBenchPhotos: (benchId) => get().manifest.links[benchId] ?? [],
-  getCoverHash: (benchId) => get().manifest.links[benchId]?.[0]?.hash,
-}));
+        const linksMap = { ...base.links };
+        delete linksMap[benchId];
+
+        const photos = { ...base.photos };
+        const gcHashes: string[] = [];
+        for (const link of links) {
+          const meta = photos[link.hash];
+          if (!meta) continue;
+          const refs = meta.refs.filter((r) => r !== benchId);
+          if (refs.length === 0) {
+            delete photos[link.hash];
+            gcHashes.push(link.hash);
+          } else {
+            photos[link.hash] = { ...meta, refs };
+          }
+        }
+
+        return {
+          manifest: { photos, links: linksMap },
+          deleteBlobs: gcHashes.length > 0 ? gcHashes : undefined,
+        };
+      });
+      set({ manifest: next });
+    },
+
+    getBenchPhotos: (benchId) => get().manifest.links[benchId] ?? [],
+    getCoverHash: (benchId) => get().manifest.links[benchId]?.[0]?.hash,
+  };
+});

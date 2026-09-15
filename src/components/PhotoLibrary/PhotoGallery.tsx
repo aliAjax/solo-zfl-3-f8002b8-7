@@ -75,25 +75,27 @@ export default function PhotoGallery({ benchId, editable = true }: PhotoGalleryP
     if (lightboxHash === hash) setLightboxHash(null);
   };
 
-  const move = (index: number, direction: -1 | 1) => {
+  const move = async (index: number, direction: -1 | 1) => {
     const next = index + direction;
     if (next < 0 || next >= photos.length) return;
     const hashes = photos.map((p) => p.hash);
     [hashes[index], hashes[next]] = [hashes[next], hashes[index]];
+    setError(null);
     try {
-      reorderPhotos(benchId, hashes);
+      await reorderPhotos(benchId, hashes);
     } catch (err) {
       console.error(err);
-      setError('排序保存失败：存储空间可能已满，顺序未被改动');
+      setError('排序保存失败，顺序未被改动');
     }
   };
 
-  const handleSetCover = (hash: string) => {
+  const handleSetCover = async (hash: string) => {
+    setError(null);
     try {
-      setCover(benchId, hash);
+      await setCover(benchId, hash);
     } catch (err) {
       console.error(err);
-      setError('设置封面失败：存储空间可能已满，未被改动');
+      setError('设置封面失败，未被改动');
     }
   };
 
