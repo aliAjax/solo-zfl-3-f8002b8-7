@@ -26,6 +26,9 @@ import {
 } from '@/types';
 import type { TimePeriodType } from '@/types';
 import Rating from '@/components/Rating/Rating';
+import PhotoGallery from '@/components/PhotoLibrary/PhotoGallery';
+import PhotoImg from '@/components/PhotoLibrary/PhotoImg';
+import { usePhotoStore } from '@/store/usePhotoStore';
 import { calculateComfortScore, getComfortLevel, getComfortColor } from '@/utils/comfort';
 
 export default function BenchDetail() {
@@ -41,6 +44,8 @@ export default function BenchDetail() {
   }, [initialized, initialize]);
 
   const bench = id ? getBenchById(id) : undefined;
+  const coverHash = usePhotoStore((s) => (id ? s.manifest.links[id]?.[0]?.hash : undefined));
+  const photoCount = usePhotoStore((s) => (id ? s.manifest.links[id]?.length ?? 0 : 0));
 
   useEffect(() => {
     if (bench === undefined && initialized) {
@@ -96,11 +101,20 @@ export default function BenchDetail() {
         <div className="lg:col-span-2 space-y-6">
           <div className="paper-texture rounded-xl shadow-paper overflow-hidden fade-in opacity-0 stagger-1">
             <div className="h-48 bg-gradient-to-br from-warm-cream via-warm-beige to-moss-green/10 relative">
-              <div className="absolute inset-0 flex items-center justify-center">
-                <div className="w-28 h-28 rounded-full bg-white/60 flex items-center justify-center backdrop-blur-sm">
-                  <Armchair className="w-14 h-14 text-moss-green/60" />
+              {coverHash ? (
+                <PhotoImg
+                  hash={coverHash}
+                  alt={`${bench.name}封面`}
+                  mode="thumb"
+                  className="absolute inset-0 w-full h-full object-cover"
+                />
+              ) : (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="w-28 h-28 rounded-full bg-white/60 flex items-center justify-center backdrop-blur-sm">
+                    <Armchair className="w-14 h-14 text-moss-green/60" />
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
 
             <div className="p-6">
@@ -211,6 +225,8 @@ export default function BenchDetail() {
               </div>
             </div>
           </div>
+
+          <PhotoGallery benchId={bench.id} editable />
         </div>
 
         <div className="space-y-6">
@@ -279,6 +295,10 @@ export default function BenchDetail() {
               <div className="flex justify-between">
                 <span className="text-ink-light">时段记录</span>
                 <span className="text-deep-brown">{bench.experiences.length} 条</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-ink-light">照片</span>
+                <span className="text-deep-brown">{photoCount} 张</span>
               </div>
             </div>
           </div>

@@ -1,8 +1,10 @@
 import { useNavigate } from 'react-router-dom';
-import { MapPin, Clock, Volume2, Sun, Armchair } from 'lucide-react';
+import { MapPin, Clock, Volume2, Sun, Armchair, Camera } from 'lucide-react';
 import type { Bench } from '@/types';
 import { MATERIAL_LABELS, SHADE_LABELS, NOISE_LABELS, STAY_DURATION_LABELS } from '@/types';
 import Rating from '@/components/Rating/Rating';
+import PhotoImg from '@/components/PhotoLibrary/PhotoImg';
+import { usePhotoStore } from '@/store/usePhotoStore';
 import { calculateComfortScore, getComfortLevel, getComfortColor } from '@/utils/comfort';
 
 interface BenchCardProps {
@@ -16,6 +18,9 @@ export default function BenchCard({ bench, index = 0 }: BenchCardProps) {
   const comfortLevel = getComfortLevel(comfortScore);
   const comfortColor = getComfortColor(comfortScore);
 
+  const coverHash = usePhotoStore((s) => s.manifest.links[bench.id]?.[0]?.hash);
+  const photoCount = usePhotoStore((s) => s.manifest.links[bench.id]?.length ?? 0);
+
   const staggerClass = `stagger-${(index % 6) + 1}`;
 
   return (
@@ -24,12 +29,28 @@ export default function BenchCard({ bench, index = 0 }: BenchCardProps) {
       className={`paper-texture rounded-xl shadow-card card-hover cursor-pointer overflow-hidden fade-in opacity-0 ${staggerClass}`}
     >
       <div className="h-36 bg-gradient-to-br from-warm-cream to-warm-beige relative overflow-hidden">
-        <div className="absolute inset-0 flex items-center justify-center">
-          <div className="w-20 h-20 rounded-full bg-moss-green/10 flex items-center justify-center">
-            <Armchair className="w-10 h-10 text-moss-green/50" />
+        {coverHash ? (
+          <PhotoImg
+            hash={coverHash}
+            alt={`${bench.name}封面`}
+            mode="thumb"
+            className="absolute inset-0 w-full h-full object-cover"
+          />
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div className="w-20 h-20 rounded-full bg-moss-green/10 flex items-center justify-center">
+              <Armchair className="w-10 h-10 text-moss-green/50" />
+            </div>
           </div>
-        </div>
-        
+        )}
+
+        {photoCount > 0 && (
+          <div className="absolute bottom-2 right-2 inline-flex items-center gap-1 px-2 py-0.5 bg-black/45 backdrop-blur-sm rounded-full text-[11px] text-white">
+            <Camera className="w-3 h-3" />
+            {photoCount}
+          </div>
+        )}
+
         <div className="absolute top-3 right-3 px-2 py-1 bg-white/80 backdrop-blur-sm rounded-full text-xs font-medium">
           <span className={comfortColor}>{comfortLevel}</span>
           <span className="text-ink-light ml-1">{comfortScore}</span>

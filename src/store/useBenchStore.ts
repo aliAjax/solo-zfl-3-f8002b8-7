@@ -1,8 +1,9 @@
 import { create } from 'zustand';
-import type { Bench, BenchExperience, MaterialType, OrientationType, ShadeLevelType, NoiseLevelType, StayDurationType } from '@/types';
+import type { Bench, BenchExperience, MaterialType, OrientationType, ShadeLevelType, NoiseLevelType } from '@/types';
 import { loadBenches, saveBenches } from '@/utils/storage';
 import { generateId } from '@/utils/comfort';
 import { mockBenches } from '@/data/mockBenches';
+import { usePhotoStore } from '@/store/usePhotoStore';
 
 interface BenchState {
   benches: Bench[];
@@ -46,6 +47,8 @@ export const useBenchStore = create<BenchState & BenchActions>((set, get) => ({
   ...initialState,
 
   initialize: () => {
+    // 照片库独立存放，随档案一起初始化
+    usePhotoStore.getState().initialize();
     const stored = loadBenches();
     if (stored.length > 0) {
       set({ benches: stored, initialized: true });
@@ -97,6 +100,8 @@ export const useBenchStore = create<BenchState & BenchActions>((set, get) => ({
     const newBenches = get().benches.filter((bench) => bench.id !== id);
     set({ benches: newBenches });
     saveBenches(newBenches);
+    // 释放该长椅的照片引用；引用归零的照片会被清走
+    void usePhotoStore.getState().releaseBenchPhotos(id);
   },
 
   getBenchById: (id) => {
