@@ -8,6 +8,8 @@ import {
   X,
   Loader2,
   AlertTriangle,
+  ShieldAlert,
+  RotateCcw,
 } from 'lucide-react';
 import { usePhotoStore } from '@/store/usePhotoStore';
 import { QuotaError } from '@/utils/photoStorage';
@@ -35,6 +37,11 @@ export default function PhotoGallery({ benchId, editable = true }: PhotoGalleryP
   const removePhoto = usePhotoStore((s) => s.removePhoto);
   const reorderPhotos = usePhotoStore((s) => s.reorderPhotos);
   const setCover = usePhotoStore((s) => s.setCover);
+  const status = usePhotoStore((s) => s.status);
+  const blockReason = usePhotoStore((s) => s.blockReason);
+  const attemptRecovery = usePhotoStore((s) => s.attemptRecovery);
+  const blocked = status === 'blocked';
+  const [recovering, setRecovering] = useState(false);
 
   const handleFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files ? Array.from(e.target.files) : [];
@@ -61,6 +68,16 @@ export default function PhotoGallery({ benchId, editable = true }: PhotoGalleryP
       }
     } finally {
       setUploading(false);
+    }
+  };
+
+  const handleRecover = async () => {
+    setRecovering(true);
+    setError(null);
+    const ok = await attemptRecovery();
+    setRecovering(false);
+    if (!ok) {
+      setError('旧清单仍无法读取，照片字节继续原样保留，未做任何删除。');
     }
   };
 
@@ -123,9 +140,10 @@ export default function PhotoGallery({ benchId, editable = true }: PhotoGalleryP
             />
             <button
               type="button"
-              disabled={uploading}
+              disabled={uploading || blocked}
               onClick={() => fileInputRef.current?.click()}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-moss-green hover:bg-moss-green/10 rounded-lg transition-colors disabled:opacity-50"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-moss-green hover:bg-moss-green/10 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title={blocked ? '照片库处于保护态' : undefined}
             >
               {uploading ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
@@ -137,6 +155,30 @@ export default function PhotoGallery({ benchId, editable = true }: PhotoGalleryP
           </>
         )}
       </div>
+
+      {blocked && (
+        <div className="mb-4 px-3 py-3 bg-amber-50 border border-amber-300/70 rounded-lg text-sm text-amber-800">
+          <div className="flex items-start gap-2">
+            <ShieldAlert className="w-4 h-4 mt-0.5 flex-shrink-0" />
+            <div className="flex-1">
+              <p className="font-medium mb-1">照片库已进入保护态，已停止一切写入与回收</p>
+              <p className="text-amber-700">{blockReason ?? '照片来源暂时无法确认。'}</p>
+              <p className="text-amber-700/80 text-xs mt-1">
+                所有照片字节与旧数据均原样保留。修复旧清单后可点击下方按钮重试；在归属确认前不会删除任何照片。
+              </p>
+              <button
+                type="button"
+                onClick={handleRecover}
+                disabled={recovering}
+                className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-amber-600 text-white rounded-md hover:bg-amber-700 disabled:opacity-60"
+              >
+                {recovering ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                {recovering ? '重试中...' : '修复旧清单后重试'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="mb-4 flex items-start gap-2 px-3 py-2.5 bg-red-50 border border-red-200/60 rounded-lg text-sm text-red-600">
@@ -178,7 +220,7 @@ export default function PhotoGallery({ benchId, editable = true }: PhotoGalleryP
                 </span>
               )}
 
-              {editable && (
+              {editable && !blocked && (
                 <div className="absolute inset-x-0 bottom-0 flex items-center justify-between px-1.5 py-1 bg-gradient-to-t from-black/55 to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
                   <div className="flex items-center gap-0.5">
                     <button
@@ -225,7 +267,7 @@ export default function PhotoGallery({ benchId, editable = true }: PhotoGalleryP
             </div>
           ))}
         </div>
-      ) : (
+      ) : !blocked ? (
         <div className="text-center py-8">
           <div className="w-12 h-12 rounded-full bg-moss-green/10 flex items-center justify-center mx-auto mb-3">
             <ImagePlus className="w-6 h-6 text-moss-green/50" />
@@ -235,7 +277,7 @@ export default function PhotoGallery({ benchId, editable = true }: PhotoGalleryP
             相同内容的照片只存一份，多张长椅可以共用
           </p>
         </div>
-      )}
+      ) : null}
 
       {lightboxPhoto && (
         <div

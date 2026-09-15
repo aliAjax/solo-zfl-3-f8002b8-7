@@ -1,13 +1,16 @@
 import { create } from 'zustand';
 import {
   initPhotoDb,
-  readManifest,
+  getProvenance,
   commitManifest,
+  migrateLegacyIntoMeta,
+  recoverFromLegacy,
   subscribePhotoChanges,
   reconcileBlobs,
   estimateAvailableBytes,
   hashBlob,
   QuotaError,
+  BlockedError,
 } from '@/utils/photoStorage';
 import type { PhotoManifest, BenchPhotoLink } from '@/utils/photoStorage';
 
@@ -18,6 +21,8 @@ export interface AddPhotosResult {
   reusedCount: number;
 }
 
+type PhotoStatus = 'loading' | 'ready' | 'empty' | 'blocked';
+
 interface HashedFile {
   file: File;
   hash: string;
@@ -26,23 +31,16 @@ interface HashedFile {
 interface PhotoState {
   manifest: PhotoManifest;
   initialized: boolean;
-  /** 数据库/清单不可用时为 true：可浏览（占位），禁止写入 */
-  manifestCorrupt: boolean;
+  status: PhotoStatus;
+  /** 保护态原因（status === 'blocked' 时有值） */
+  blockReason: string | null;
   initialize: () => void;
-  /**
-   * 为一张长椅批量添加照片。
-   * 哈希与预检在事务外完成；最终去重、引用计数、blob 写入与清单更新
-   * 在一个跨标签页串行的 IDB 事务内原子提交。
-   * 任一步失败整体回滚，不留下断链；两个标签页同时上传不会互相覆盖。
-   */
+  /** 保护态下用户确认旧数据已修好后重试恢复；失败继续保留现场 */
+  attemptRecovery: () => Promise<boolean>;
   addPhotos: (benchId: string, files: File[]) => Promise<AddPhotosResult>;
-  /** 从长椅移除一张照片；该照片引用归零时同一事务内清走 blob */
   removePhoto: (benchId: string, hash: string) => Promise<void>;
-  /** 调整某张长椅内照片顺序 */
   reorderPhotos: (benchId: string, orderedHashes: string[]) => Promise<void>;
-  /** 把某张照片设为封面（移到第一位） */
   setCover: (benchId: string, hash: string) => Promise<void>;
-  /** 删除长椅时调用：释放其全部照片引用并 GC */
   releaseBenchPhotos: (benchId: string) => Promise<void>;
   getBenchPhotos: (benchId: string) => BenchPhotoLink[];
   getCoverHash: (benchId: string) => string | undefined;
@@ -51,68 +49,107 @@ interface PhotoState {
 const EMPTY_MANIFEST: PhotoManifest = { photos: {}, links: {}, revision: 0 };
 
 export const usePhotoStore = create<PhotoState>((set, get) => {
-  /** 把数据库的最新清单同步进内存（跨标签页改动后调用） */
-  const refresh = async () => {
-    try {
-      const manifest = await readManifest();
-      set({ manifest, manifestCorrupt: false });
-    } catch (error) {
-      console.error('照片清单刷新失败：', error);
+  /** 根据来源状态装载内存；来源未证实时不装载空清单、不动字节 */
+  const probe = async (): Promise<PhotoStatus> => {
+    const provenance = await getProvenance();
+    if (provenance.status === 'ready') {
+      // 合法清单就位：可以安全回收孤儿
+      reconcileBlobs().catch((e) => console.warn('照片回收跳过：', e));
+      set({
+        manifest: provenance.manifest,
+        status: 'ready',
+        blockReason: null,
+      });
+      return 'ready';
     }
+    if (provenance.status === 'legacy-readable') {
+      // 旧清单可读但尚未迁入：安全迁入（只在确认无阻断标记时生效）
+      try {
+        const manifest = await migrateLegacyIntoMeta();
+        set({ manifest, status: 'ready', blockReason: null });
+        return 'ready';
+      } catch (error) {
+        if (error instanceof BlockedError) {
+          set({ status: 'blocked', blockReason: error.reason });
+          return 'blocked';
+        }
+        throw error;
+      }
+    }
+    if (provenance.status === 'empty') {
+      set({ manifest: EMPTY_MANIFEST, status: 'empty', blockReason: null });
+      return 'empty';
+    }
+    // blocked：保留现场，不装载空清单（内存仍为空，但 UI 依据 status 禁写并提示）
+    set({ status: 'blocked', blockReason: provenance.reason });
+    return 'blocked';
   };
 
-  /** 跨标签页的并发安全：仅当新清单修订号更新时才覆盖内存 */
-  const refreshIfNewer = async () => {
-    try {
-      const latest = await readManifest();
-      if (latest.revision > get().manifest.revision) {
-        set({ manifest: latest, manifestCorrupt: false });
-      }
-    } catch (error) {
-      console.error('照片清单跨标签页同步失败：', error);
+  const guardWritable = (): void => {
+    const { status, blockReason } = get();
+    if (status === 'loading') {
+      throw new Error('照片库尚在初始化');
+    }
+    if (status === 'blocked') {
+      throw new BlockedError(blockReason ?? '来源不可用');
     }
   };
 
   return {
     manifest: EMPTY_MANIFEST,
     initialized: false,
-    manifestCorrupt: false,
+    status: 'loading',
+    blockReason: null,
 
     initialize: () => {
       if (get().initialized) return;
-      // 先标记，避免 StrictMode / 多入口重复初始化
       set({ initialized: true });
 
       initPhotoDb()
-        .then(async () => {
-          // 后台对账：清掉无引用孤儿 blob（与清单同库串行，不会误删在途上传）
-          reconcileBlobs().catch((e) => console.warn('照片对账跳过：', e));
-          await refresh();
-          // 订阅其它标签页的提交
+        .then(() => probe())
+        .then(() => {
           subscribePhotoChanges(() => {
-            void refreshIfNewer();
+            // 其它标签页提交后按权威来源重新装载（保护态也可能被对方解除）
+            void probe().catch((e) => console.error('照片库跨标签页同步失败：', e));
           });
         })
         .catch((error) => {
           console.error('照片库初始化失败，照片以占位显示：', error);
-          set({ manifestCorrupt: true });
+          set({
+            status: 'blocked',
+            blockReason:
+              error instanceof Error
+                ? `照片库无法打开：${error.message}。照片字节未被改动。`
+                : '照片库无法打开，照片字节未被改动。',
+          });
         });
+    },
+
+    attemptRecovery: async () => {
+      try {
+        const manifest = await recoverFromLegacy();
+        reconcileBlobs().catch((e) => console.warn('照片回收跳过：', e));
+        set({ manifest, status: 'ready', blockReason: null });
+        return true;
+      } catch (error) {
+        // 旧数据仍不可读：继续保留现场
+        const reason =
+          error instanceof BlockedError
+            ? error.reason
+            : error instanceof Error
+              ? error.message
+              : '恢复失败，继续保留现场';
+        set({ status: 'blocked', blockReason: reason });
+        return false;
+      }
     },
 
     addPhotos: async (benchId, files) => {
       if (files.length === 0) {
         return { ok: false, error: '没有选择照片', addedCount: 0, reusedCount: 0 };
       }
-      if (get().manifestCorrupt) {
-        return {
-          ok: false,
-          error: '照片库当前不可用，已禁止写入，已有内容不受影响',
-          addedCount: 0,
-          reusedCount: 0,
-        };
-      }
+      guardWritable();
 
-      // 1. 类型校验：任一非图片，整批拒绝
       const invalid = files.find((f) => !f.type.startsWith('image/'));
       if (invalid) {
         return {
@@ -123,7 +160,6 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
         };
       }
 
-      // 2. 哈希（只读，不改数据）
       const hashed: HashedFile[] = [];
       for (const file of files) {
         try {
@@ -139,8 +175,7 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
         }
       }
 
-      // 3. 建议性配额预检（以已知清单估算真正要新写的字节；
-      //    权威判定在事务内；预检仅用于尽早、明确地拒绝）
+      // 建议性配额预检；权威判重在事务内
       const snapshot = get().manifest;
       const knownHashes = new Set([
         ...Object.keys(snapshot.photos),
@@ -156,7 +191,6 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
         }
       }
 
-      // 4. 事务内权威提交。闭包回传统计结果。
       const stats = { addedLinks: 0, reusedStorage: 0, duplicatePicks: 0, requiredInTx: 0 };
       let next: PhotoManifest;
       try {
@@ -168,7 +202,6 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
           const appended: BenchPhotoLink[] = [];
           const putBlobs: { hash: string; blob: Blob }[] = [];
           const seen = new Set<string>();
-          let txRequired = 0;
 
           for (const { file, hash } of hashed) {
             if (existingHashes.has(hash) || seen.has(hash)) {
@@ -179,7 +212,6 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
             appended.push({ hash, name: file.name });
 
             if (photos[hash]) {
-              // 内容已存在（可能正是另一个标签页刚提交的）：共用这份存储
               stats.reusedStorage += 1;
               if (!photos[hash].refs.includes(benchId)) {
                 photos[hash] = { ...photos[hash], refs: [...photos[hash].refs, benchId] };
@@ -187,11 +219,10 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
             } else {
               photos[hash] = { hash, type: file.type, size: file.size, refs: [benchId] };
               putBlobs.push({ hash, blob: file });
-              txRequired += file.size;
+              stats.requiredInTx += file.size;
             }
           }
           stats.addedLinks = appended.length;
-          stats.requiredInTx = txRequired;
 
           return {
             manifest: {
@@ -203,8 +234,16 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
         });
       } catch (error) {
         if (error instanceof QuotaError) throw error;
+        if (error instanceof BlockedError) {
+          set({ status: 'blocked', blockReason: error.reason });
+          return {
+            ok: false,
+            error: `照片库处于保护态：${error.reason}`,
+            addedCount: 0,
+            reusedCount: 0,
+          };
+        }
         console.error('照片事务提交失败，已回滚：', error);
-        // 可能是预检后空间被占用：给出明确的空间类提示
         const available = await estimateAvailableBytes();
         if (available !== null && stats.requiredInTx > available) {
           throw new QuotaError(stats.requiredInTx, available);
@@ -217,7 +256,7 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
         };
       }
 
-      set({ manifest: next, manifestCorrupt: false });
+      set({ manifest: next, status: 'ready' });
       return {
         ok: true,
         addedCount: stats.addedLinks,
@@ -226,7 +265,7 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
     },
 
     removePhoto: async (benchId, hash) => {
-      if (get().manifestCorrupt) throw new Error('照片库当前不可用，已禁止改动');
+      guardWritable();
       const next = await commitManifest((base) => {
         const links = base.links[benchId];
         if (!links?.some((l) => l.hash === hash)) {
@@ -260,7 +299,7 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
     },
 
     reorderPhotos: async (benchId, orderedHashes) => {
-      if (get().manifestCorrupt) throw new Error('照片库当前不可用，已禁止改动');
+      guardWritable();
       const next = await commitManifest((base) => {
         const links = base.links[benchId];
         if (!links) return { manifest: { photos: base.photos, links: base.links } };
@@ -268,7 +307,6 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
         const reordered = orderedHashes
           .map((h) => byHash.get(h))
           .filter((l): l is BenchPhotoLink => Boolean(l));
-        // 只允许重排、不允许增删；集合不一致则放弃本次改动
         if (reordered.length !== links.length) {
           return { manifest: { photos: base.photos, links: base.links } };
         }
@@ -280,7 +318,7 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
     },
 
     setCover: async (benchId, hash) => {
-      if (get().manifestCorrupt) throw new Error('照片库当前不可用，已禁止改动');
+      guardWritable();
       const next = await commitManifest((base) => {
         const links = base.links[benchId];
         if (!links?.some((l) => l.hash === hash)) {
@@ -296,7 +334,9 @@ export const usePhotoStore = create<PhotoState>((set, get) => {
     },
 
     releaseBenchPhotos: async (benchId) => {
-      if (get().manifestCorrupt) return;
+      // 保护态下不做任何改动（长椅档案仍可正常删除）
+      if (get().status === 'blocked') return;
+      if (get().status === 'loading') return;
       const next = await commitManifest((base) => {
         const links = base.links[benchId];
         if (!links) return { manifest: { photos: base.photos, links: base.links } };
